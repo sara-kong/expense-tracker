@@ -12,6 +12,33 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Iterable
 
+# --- UX helpers (pretty output via Rich, with safe fallback) ---
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich import box
+    _console = Console(force_terminal=True)  # force color/borders
+    _has_rich = True
+except ImportError:
+    _has_rich = False
+    Console = Table = box = None  # type: ignore
+
+def print_table(headers, rows, title=None):
+    """Pretty table if Rich is available; otherwise plain text."""
+    if _has_rich:
+        t = Table(*headers, title=title, box=box.ROUNDED, show_header=True, header_style="bold")
+        for r in rows:
+            t.add_row(*[str(x) for x in r])
+        _console.print(t)
+    else:
+        if title:
+            print(title)
+        print(" | ".join(headers))
+        print("-" * (len(" | ".join(headers)) + 4))
+        for r in rows:
+            print(" | ".join(str(x) for x in r))
+
+
 # ---------- Storage ----------
 DATA_DIR = Path(os.getenv("XPENSE_DATA_DIR", "data"))  # overridable for tests
 EXPENSES_CSV = DATA_DIR / "expenses.csv"
@@ -152,11 +179,31 @@ def cmd_list(args):
         return
     ex.sort(key=lambda x: (x.when, x.category))
     total = sum(e.amount for e in ex)
-    print(f"{len(ex)} expenses. Total: {fmt_money(total)}")
-    print("-"*72)
+    rows = []
+    show_ids = bool(getattr(args, "with_id", False))
+    # compute row ids deterministically
+    from collections import defaultdict as _dd
+    all_rows = []
+    for e in load_expenses():
+        all_rows.append((e.when, e.amount, e.category, e.note))
+    bucket = _dd(list)
+    for idx, tup in enumerate(all_rows, 1):
+        bucket[tup].append(idx)
+    def ridx_for(e):
+        return bucket[(e.when, e.amount, e.category, e.note)].pop(0)
+
     for e in ex:
-        note = f" — {e.note}" if e.note else ""
-        print(f"{e.when}  {fmt_money(e.amount):>10}  {e.category:<12}{note}")
+        note = f"{e.note}" if e.note else ""
+        base = [e.when, f"{fmt_money(e.amount):>10}", e.category, note]
+        if show_ids:
+            rows.append([ridx_for(e)] + base)
+        else:
+            rows.append(base)
+
+    headers = (["ID","Date","Amount","Category","Note"] if show_ids
+               else ["Date","Amount","Category","Note"])
+    print_table(headers, rows, title=f"{len(ex)} expenses — Total {fmt_money(total)}")
+
 
 def cmd_summary(args):
     expenses = load_expenses()
@@ -209,24 +256,37 @@ def cmd_report(args):
     expenses = filter_expenses(load_expenses(), start, end, None)
     totals = summarize(expenses)
     budgets = load_budgets()
+
     cats = sorted(set(list(totals.keys()) + list(budgets.keys())))
     if not cats:
         print("No data/budgets yet.")
         return
-    print(f"Report — {today.strftime('%B %Y')} (MTD)")
-    print("-"*72)
-    header = f"{'Category':<15}{'Spent':>12}  {'Budget':>12}  {'Left(+)/Over(-)':>16}"
-    print(header)
-    print("-"*72)
+        
+    rows = []
     for c in cats:
         spent = totals.get(c, 0.0)
         budget = budgets.get(c, 0.0)
         left = budget - spent if budget else 0.0
-        print(f"{c:<15}{fmt_money(spent):>12}  {fmt_money(budget):>12}  {fmt_money(left):>16}")
-    print("-"*72)
-    grand_spent = sum(totals.values())
-    grand_budget = sum(budgets.get(c, 0.0) for c in cats)
-    print(f"{'TOTAL':<15}{fmt_money(grand_spent):>12}  {fmt_money(grand_budget):>12}  {fmt_money(grand_budget - grand_spent):>16}")
+
+        if _has_rich and budget > 0:
+            if left > 0:
+                spent_str = f"[green]{fmt_money(spent)}[/green]"
+                left_str = f"[green]{fmt_money(left)}[/green]"
+            elif left == 0:
+                spent_str = f"[yellow]{fmt_money(spent)}[/yellow]"
+                left_str = f"[yellow]{fmt_money(left)}[/yellow]"
+            else:
+                spent_str = f"[red]{fmt_money(spent)}[/red]"
+                left_str = f"[red]{fmt_money(left)}[/red]"
+        else:
+            spent_str = fmt_money(spent)
+            left_str = fmt_money(left)
+
+        rows.append([c, fmt_money(spent), fmt_money(budget), fmt_money(left)])
+
+    print_table(["Category","Spent","Budget","Left(+)/Over(-)"], rows,
+                title=f"Report — {today.strftime('%B %Y')} (MTD)")
+
 
 # ---------- CLI ----------
 def build_parser():
@@ -245,6 +305,7 @@ def build_parser():
     l.add_argument("-s", "--start", type=str, help="YYYY-MM-DD")
     l.add_argument("-e", "--end", type=str, help="YYYY-MM-DD")
     l.add_argument("-c", "--category", type=str, help="Filter by category")
+    l.add_argument("--with-id", action="store_true", help="Show row numbers")
     l.set_defaults(func=cmd_list)
 
     s = sub.add_parser("summary", help="Totals by category")
